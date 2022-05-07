@@ -1,0 +1,21 @@
+stages:
+  - deploy
+variables:
+  GIT_STRATEGY: clone
+deploy_autotest:
+  stage: deploy
+  tags: [mw-openshift-test-01, autotest] ## tags of gitlab-runner
+  only:
+    - autotest
+
+  before_script:
+    - echo "Deploy Configmaps to reliz namespace on mw-open-shift-test-01"
+    - oc login "${MW_OPENSHIFT_TEST}" -u "$CI_MW_OPENSHIFT_USER" -p "$CI_MW_OPENSHIFT_PASS" --insecure-skip-tls-verify
+    - oc project "reliz"
+
+  script:
+    - echo CI_COMMIT_SHA=${CI_COMMIT_SHA}
+    - echo CI_MERGE_REQUEST_TARGET_BRANCH_NAME=${CI_COMMIT_BRANCH}
+    - git fetch origin ${CI_COMMIT_BRANCH}
+    - FILES=$(git diff --no-commit-id --name-only -r ${CI_COMMIT_SHA}^!)
+    - oc apply -f "${FILES}"
