@@ -1,0 +1,48 @@
+image: maven:latest
+
+variables:
+  MAVEN_OPTS: "-Dmaven.repo.local=.m2/repository"
+  APP_NAME: app-api
+  
+cache:
+  paths:
+    - .m2/repository
+
+stages:
+  - build
+  - package
+  - dockerise
+
+Build Project:
+  stage: build
+  tags: [dev]
+  only:
+    - release
+  script:
+    - mvn $MAVEN_OPTS compile
+
+Package artifacts:
+  stage: package
+  image: openjdk:17-alpine
+  tags: [dev]
+  only:
+    - release
+  script:
+    - mvn $MAVEN_OPTS package
+  artifacts:
+    paths:
+      - target/*.jar
+
+Dockerise:
+  stage: dockerise
+  image: docker:latest
+  tags: [dev]
+  only:
+    - release
+  services:
+    - docker:dind
+  script:
+    - cd app
+    - docker build -t $CI_OPENSHIFT_REGISTRY/dev/$APP_NAME:latest .
+    - docker login "$CI_OPENSHIFT_REGISTRY" -p $(oc whoami -t) -u "$OPENSHIFT_USER"
+    - docker push  $CI_OPENSHIFT_REGISTRY/dev/$APP_NAME:latest
