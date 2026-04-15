@@ -1,0 +1,157 @@
+stages:
+  - build
+  - liquibase
+  - deploy-configs
+  - docker-build-push
+  - cleanup
+
+variables:
+  GIT_STRATEGY: clone
+  NODE_OPTIONS: "--max-old-space-size=1512"
+  GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.parallel=true"
+ 
+  DEPLOY_ONLY_CONFIGS:
+    value: "false"
+    description: "Деплоїти тільки конфіги (пропустити збірку та docker)"
+    options: ["true", "false"]
+   
+  SELECTED_SERVICE:
+    value: "all"
+    description: "Виберіть модуль для ДЕПЛОЮ або 'all' для всіх"
+    options:
+      - "all"
+      - "app1"
+      - "app2"
+      - "app3"
+      - "app4"
+
+  PLATFORM:
+    value: "release"
+    description: "Цільове середовище"
+    options: ["dev", "autotest", "release"]
+
+.env_setup:
+  before_script:
+    - |-
+      if [[ "$PLATFORM" == "autotest" ]]; then
+        export NAMESPACE="autotest"; export DB_NAME="$db_name"
+      elif [[ "$PLATFORM" == "release" ]]; then
+        export NAMESPACE="reliz"; export DB_NAME="$db_name_reliz"
+      else
+        export NAMESPACE="dev"; export DB_NAME="$db_name_dev"
+      fi
+      export PLATFORM="tst-${NAMESPACE}"
+    - aws ecr get-login-password --region eu-central-1 --profile ITB-TOOLS | docker login --username AWS --password-stdin $ITB-TOOLS-REGISTRY
+
+default:
+  tags: [ docker-runner ]
+
+build:
+  stage: build
+  image: $ITB-TOOLS-REGISTRY/$namespace/core-build-al2023
+  rules:
+    - if: '$DEPLOY_ONLY_CONFIGS == "true"'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop" || $CI_PIPELINE_SOURCE == "web"'
+      when: on_success
+  script:
+    - node -v
+    - npm config set strict-ssl false
+    - npm config set registry https://nexus.com.ua/repository/npm-group/
+    - gradle clean build --stacktrace -PnodejsDownload=false -PbuildBranch="$CI_COMMIT_REF_NAME" -PbuildNumber="$CI_PIPELINE_ID" -PcommitTitle="$CI_COMMIT_TITLE" -Dskip-utils=1 -Dskip-mocks=1
+  artifacts:
+    paths:
+      - build/distrib/
+    expire_in: 1 hrs
+    exclude:
+      - build/distrib/*-plain.jar
+
+.core_matrix:
+  parallel:
+    matrix:
+      - SERVICE: "app1"
+        MODULE_DIR: "back/project1/app1"
+        APP_NAME: "app1"
+        CONFIG_FILE: "devops/release/app1/app1-configmap.yml"
+      - SERVICE: "app2"
+        MODULE_DIR: "back/project2/app2"
+        APP_NAME: "app2"
+        CONFIG_FILE: "devops/release/app2/app2-configmap.yml"
+      - SERVICE: "app3"
+        MODULE_DIR: "back/project3/app3"
+        APP_NAME: "app3"
+        CONFIG_FILE: "devops/release/app3/app3-configmap.yml"
+      - SERVICE: "app4"
+        MODULE_DIR: "back/project4/app4"
+        APP_NAME: "app4"
+        CONFIG_FILE: "devops/release/app4/app4-configmap.yml"
+
+.module_rules:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web" && $SELECTED_SERVICE != "all" && $SELECTED_SERVICE != $SERVICE'
+      when: never
+    - if: ('$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop"')
+      changes:
+        - "$MODULE_DIR/**/*"
+      when: on_success
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: on_success
+
+liquibase:
+  stage: liquibase
+  extends: [.env_setup, .core_matrix]
+  dependencies: [build]
+  tags: [shell_runner]
+  rules:
+    - !reference [.module_rules, rules]
+  script:
+    - echo $DB_URL
+    - cd build/distrib
+    - ls -l
+    - java -Dspring.datasource.url="$DB_URL" -Dspring.liquibase.user="$DB_USER" -Dspring.liquibase.password="$DB_PASSWORD" -jar database.jar
+
+deploy-configs:
+  stage: deploy-configs
+  extends: [.env_setup, .core_matrix]
+  tags: [shell_runner]
+  dependencies: []
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web" && $SELECTED_SERVICE != "all" && $SELECTED_SERVICE == $SERVICE'
+      when: manual
+      allow_failure: true
+    - if: '$CI_PIPELINE_SOURCE == "web" && $SELECTED_SERVICE == "all"'
+      when: manual
+      allow_failure: true
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop"'
+      when: manual
+    - when: never
+  script:
+    - aws ecr get-login-password --region eu-central-1 --profile ITB-WRKLD-TST | docker login --username AWS --password-stdin $TEST_EKS_REGISTRY
+    - kubectl config use-context EKS-TST
+    - kubectl apply -f $CONFIG_FILE -n $
+    - if [[ "$DEPLOY_ONLY_CONFIGS" == "true" ]]; then
+        kubectl rollout restart deployment/$APP_NAME -n $;
+        kubectl rollout status deployment/$APP_NAME -n $ --timeout=320s;
+      fi
+
+docker-build-push:
+  stage: docker-build-push
+  extends: [.env_setup, .core_matrix]
+  dependencies: [build]
+  tags: [shell_runner]
+  rules:
+    - !reference [.module_rules, rules]
+  script:
+    - docker build --no-cache -t $TEST_EKS_REGISTRY/$/$APP_NAME:latest -f $MODULE_DIR/Dockerfile .
+    - aws ecr get-login-password --region eu-central-1 --profile ITB-WRKLD-TST | docker login --username AWS --password-stdin $TEST_EKS_REGISTRY
+    - docker push $TEST_EKS_REGISTRY/$/$APP_NAME:latest
+    - kubectl rollout restart deployment/$APP_NAME -n $
+    - kubectl rollout status deployment/$APP_NAME -n $ --timeout=320s
+
+cleanup:
+  stage: cleanup
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop" || $CI_PIPELINE_SOURCE == "web"'
+      when: always
+  script:
+    - rm -rf build/distrib/
